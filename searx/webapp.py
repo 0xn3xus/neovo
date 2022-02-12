@@ -94,9 +94,10 @@ from searx.plugins import plugins
 from searx.plugins.oa_doi_rewrite import get_doi_resolver
 from searx.preferences import Preferences, ValidationException, LANGUAGE_CODES
 from searx.answerers import answerers
-from searx.network import stream as http_stream
+from searx.network import stream as http_stream, set_context_network_name
 from searx.answerers import ask
 from searx.metrology.error_recorder import errors_per_engines
+from searx.settings_loader import get_default_settings_path
 
 # serve pages with HTTP/1.1
 from werkzeug.serving import WSGIRequestHandler
@@ -152,7 +153,7 @@ werkzeug_reloader = flask_run_development or (searx_debug and __name__ == "__mai
 # initialize the engines except on the first run of the werkzeug server.
 if not werkzeug_reloader\
    or (werkzeug_reloader and os.environ.get("WERKZEUG_RUN_MAIN") == "true"):
-    search_initialize(enable_checker=True)
+    search_initialize(enable_checker=True, check_network=True)
 
 babel = Babel(app)
 
@@ -371,8 +372,6 @@ def image_proxify(url):
 
 def get_translations():
     return {
-        # when overpass AJAX request fails (on a map result)
-        'could_not_load': gettext('could not load data'),
         # when there is autocompletion
         'no_item_found': gettext('No item found')
     }
@@ -584,6 +583,11 @@ def index():
         selected_categories=get_selected_categories(request.preferences, request.form),
         advanced_search=advanced_search,
     )
+
+
+@app.route('/healthz', methods=['GET'])
+def health():
+    return Response('OK', mimetype='text/plain')
 
 
 @app.route('/search', methods=['GET', 'POST'])
@@ -917,6 +921,8 @@ def _is_selected_language_supported(engine, preferences):
 
 @app.route('/image_proxy', methods=['GET'])
 def image_proxy():
+    # pylint: disable=too-many-return-statements, too-many-branches
+
     url = request.args.get('url')
 
     if not url:
@@ -928,16 +934,23 @@ def image_proxy():
         return '', 400
 
     maximum_size = 5 * 1024 * 1024
-
+    forward_resp = False
+    resp = None
     try:
-        headers = dict_subset(request.headers, {'If-Modified-Since', 'If-None-Match'})
-        headers['User-Agent'] = gen_useragent()
+        request_headers = {
+            'User-Agent': gen_useragent(),
+            'Accept': 'image/webp,*/*',
+            'Accept-Encoding': 'gzip, deflate',
+            'Sec-GPC': '1',
+            'DNT': '1',
+        }
+        set_context_network_name('image_proxy')
         stream = http_stream(
             method='GET',
             url=url,
-            headers=headers,
+            headers=request_headers,
             timeout=settings['outgoing']['request_timeout'],
-            allow_redirects=True,
+            follow_redirects=True,
             max_redirects=20)
 
         resp = next(stream)
@@ -945,25 +958,37 @@ def image_proxy():
         if content_length and content_length.isdigit() and int(content_length) > maximum_size:
             return 'Max size', 400
 
-        if resp.status_code == 304:
-            return '', resp.status_code
-
         if resp.status_code != 200:
             logger.debug('image-proxy: wrong response code: {0}'.format(resp.status_code))
             if resp.status_code >= 400:
                 return '', resp.status_code
             return '', 400
 
-        if not resp.headers.get('content-type', '').startswith('image/'):
-            logger.debug('image-proxy: wrong content-type: {0}'.format(resp.headers.get('content-type')))
+        if not resp.headers.get('Content-Type', '').startswith('image/'):
+            logger.debug('image-proxy: wrong content-type: %s', resp.headers.get('Content-Type', ''))
             return '', 400
 
-        headers = dict_subset(resp.headers, {'Content-Length', 'Length', 'Date', 'Last-Modified', 'Expires', 'Etag'})
+        forward_resp = True
+    except httpx.HTTPError:
+        logger.exception('HTTP error')
+        return '', 400
+    finally:
+        if resp and not forward_resp:
+            # the code is about to return an HTTP 400 error to the browser
+            # we make sure to close the response between searxng and the HTTP server
+            try:
+                resp.close()
+            except httpx.HTTPError:
+                logger.exception('HTTP error on closing')
 
-        total_length = 0
+    try:
+        headers = dict_subset(
+            resp.headers,
+            {'Content-Type', 'Content-Encoding', 'Content-Length', 'Length'}
+        )
 
         def forward_chunk():
-            nonlocal total_length
+            total_length = 0
             for chunk in stream:
                 total_length += len(chunk)
                 if total_length > maximum_size:
@@ -1137,8 +1162,18 @@ def run():
         use_debugger=searx_debug,
         port=settings['server']['port'],
         host=settings['server']['bind_address'],
-        threaded=True
+        threaded=True,
+        extra_files=[
+            get_default_settings_path()
+        ],
     )
+
+
+def patch_application(app):
+    # serve pages with HTTP/1.1
+    WSGIRequestHandler.protocol_version = "HTTP/{}".format(settings['server']['http_protocol_version'])
+    # patch app to handle non root url-s behind proxy & wsgi
+    app.wsgi_app = ReverseProxyPathFix(ProxyFix(app.wsgi_app))
 
 
 class ReverseProxyPathFix:
